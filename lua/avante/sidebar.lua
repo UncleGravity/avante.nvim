@@ -34,22 +34,24 @@ local Sidebar = {}
 ---@field result NuiSplit | nil
 ---@field selected_code NuiSplit | nil
 ---@field input NuiSplit | nil
+---@field conversation {role: string, content: string}[]
 
 ---@param id integer the tabpage id retrieved from api.nvim_get_current_tabpage()
 function Sidebar:new(id)
-  return setmetatable({
-    id = id,
-    registered_cmp = false,
-    code = { bufnr = 0, winid = 0, selection = nil },
-    winids = {
-      result = 0,
-      selected_code = 0,
-      input = 0,
-    },
-    result = nil,
-    selected_code = nil,
-    input = nil,
-  }, { __index = self })
+  local instance = setmetatable({}, self)
+  instance.id = id
+  instance.conversation = {}
+  instance.registered_cmp = false
+  instance.code = { bufnr = 0, winid = 0, selection = nil }
+  instance.winids = {
+    result = 0,
+    selected_code = 0,
+    input = 0,
+  }
+  instance.result = nil
+  instance.selected_code = nil
+  instance.input = nil
+  return instance
 end
 
 function Sidebar:delete_autocmds()
@@ -948,46 +950,41 @@ end
 ---@param content string concatenated content of the buffer
 ---@param opts? {focus?: boolean, stream?: boolean, scroll?: boolean, callback?: fun(): nil} whether to focus the result view
 function Sidebar:update_content(content, opts)
-  if not self.result or not self.result.bufnr then return end
-  opts = vim.tbl_deep_extend("force", { focus = true, scroll = true, stream = false, callback = nil }, opts or {})
-  if opts.stream then
-    local scroll_to_bottom = function()
-      local last_line = api.nvim_buf_line_count(self.result.bufnr)
+  opts = opts or {}
+  if not self.result or not self.result.bufnr or not api.nvim_buf_is_valid(self.result.bufnr) then return self end
 
-      local current_lines = Utils.get_buf_lines(last_line - 1, last_line, self.result.bufnr)
+  local function append_to_conversation(role, message)
+    table.insert(self.conversation, { role = role, content = message })
+  end
 
-      if #current_lines > 0 then
-        local last_line_content = current_lines[1]
-        local last_col = #last_line_content
-        xpcall(
-          function() api.nvim_win_set_cursor(self.result.winid, { last_line, last_col }) end,
-          function(err) return err end
-        )
-      end
-    end
-
+  if opts.append then
+    append_to_conversation("assistant", content)
     vim.schedule(function()
       if not self.result or not self.result.bufnr or not api.nvim_buf_is_valid(self.result.bufnr) then return end
-      scroll_to_bottom()
       local lines = vim.split(content, "\n")
       Utils.unlock_buf(self.result.bufnr)
       api.nvim_buf_call(self.result.bufnr, function() api.nvim_put(lines, "c", true, true) end)
       Utils.lock_buf(self.result.bufnr)
       api.nvim_set_option_value("filetype", "Avante", { buf = self.result.bufnr })
-      if opts.scroll then scroll_to_bottom() end
+      if opts.scroll then Utils.buf_scroll_to_end(self.result.bufnr) end
       if opts.callback ~= nil then opts.callback() end
     end)
   else
+    self.conversation = {}
+    append_to_conversation("user", content)
     vim.defer_fn(function()
       if not self.result or not self.result.bufnr or not api.nvim_buf_is_valid(self.result.bufnr) then return end
-      local lines = vim.split(content, "\n")
+      local lines = {}
+      for _, message in ipairs(self.conversation) do
+        table.insert(lines, message.role .. ": " .. message.content)
+        table.insert(lines, "")
+      end
       Utils.unlock_buf(self.result.bufnr)
       api.nvim_buf_set_lines(self.result.bufnr, 0, -1, false, lines)
       Utils.lock_buf(self.result.bufnr)
       api.nvim_set_option_value("filetype", "Avante", { buf = self.result.bufnr })
       if opts.focus and not self:is_focused_on_result() then
         xpcall(function()
-          --- set cursor to bottom of result view
           api.nvim_set_current_win(self.result.winid)
         end, function(err) return err end)
       end
@@ -1177,128 +1174,28 @@ function Sidebar:create_input(opts)
 
   local chat_history = Path.history.load(self.code.bufnr)
 
-  ---@param request string
   local function handle_submit(request)
-    local model = Config.has_provider(Config.provider) and Config.get_provider(Config.provider).model or "default"
-
-    local timestamp = get_timestamp()
-
-    local content_prefix = get_chat_record_prefix(timestamp, Config.provider, model, request)
-
-    --- HACK: we need to set focus to true and scroll to false to
-    --- prevent the cursor from jumping to the bottom of the
-    --- buffer at the beginning
-    self:update_content("", { focus = true, scroll = false })
-    self:update_content(content_prefix .. "**Generating response ...**\n")
-
-    local content = table.concat(Utils.get_buf_lines(0, -1, self.code.bufnr), "\n")
-    local content_with_line_numbers = Utils.prepend_line_number(content)
-
-    local filetype = api.nvim_get_option_value("filetype", { buf = self.code.bufnr })
-
-    local selected_code_content_with_line_numbers = nil
-    if self.code.selection ~= nil then
-      selected_code_content_with_line_numbers =
-        Utils.prepend_line_number(self.code.selection.content, self.code.selection.range.start.line)
-    end
-
-    if request:sub(1, 1) == "/" then
-      local command, args = request:match("^/(%S+)%s*(.*)")
-      if command == nil then
-        self:update_content("Invalid command", { focus = false, scroll = false })
-        return
-      end
-      local cmds = self:get_commands()
-      ---@type AvanteSlash
-      local cmd = vim.iter(cmds):filter(function(_) return _.command == command end):totable()[1]
-      if cmd then
-        if command == "lines" then
-          cmd.callback(args, function(args_)
-            local start_line, end_line, question = args_:match("(%d+)-(%d+)%s+(.*)")
-            ---@cast start_line integer
-            start_line = tonumber(start_line)
-            ---@cast end_line integer
-            end_line = tonumber(end_line)
-            if end_line == nil then
-              Utils.error("Invalid end line number", { once = true, title = "Avante" })
-              return
-            end
-            selected_code_content_with_line_numbers = Utils.prepend_line_number(
-              table.concat(api.nvim_buf_get_lines(self.code.bufnr, start_line - 1, end_line, false), "\n"),
-              start_line
-            )
-            request = question
-          end)
-        else
-          cmd.callback(args)
-          return
-        end
-      else
-        self:update_content("Unknown command: " .. command, { focus = false, scroll = false })
-        return
-      end
-    end
-
-    local full_response = ""
-
-    local is_first_chunk = true
-
-    ---@type AvanteChunkParser
-    local on_chunk = function(chunk)
-      full_response = full_response .. chunk
-      if is_first_chunk then
-        is_first_chunk = false
-        self:update_content(content_prefix .. chunk, { stream = false, scroll = true })
-        return
-      end
-      self:update_content(chunk, { stream = true, scroll = true })
-      vim.schedule(function() vim.cmd("redraw") end)
-    end
-
-    ---@type AvanteCompleteParser
-    local on_complete = function(err)
-      if err ~= nil then
-        self:update_content("\n\nError: " .. vim.inspect(err), { stream = true, scroll = true })
-        return
-      end
-
-      -- Execute when the stream request is actually completed
-      self:update_content("\n\n**Generation complete!** Please review the code suggestions above.", {
-        stream = true,
-        scroll = true,
-        callback = function() api.nvim_exec_autocmds("User", { pattern = VIEW_BUFFER_UPDATED_PATTERN }) end,
-      })
-
-      vim.defer_fn(function()
-        if self.result and self.result.winid and api.nvim_win_is_valid(self.result.winid) then
-          api.nvim_set_current_win(self.result.winid)
-        end
-      end, 0)
-
-      -- Save chat history
-      table.insert(chat_history or {}, {
-        timestamp = timestamp,
-        provider = Config.provider,
-        model = model,
-        request = request,
-        response = full_response,
-      })
-      Path.history.save(self.code.bufnr, chat_history)
-    end
-
+    self:update_content(request, { append = false })
+    
     Llm.stream({
       bufnr = self.code.bufnr,
-      ask = opts.ask,
-      file_content = content_with_line_numbers,
-      code_lang = filetype,
-      selected_code = selected_code_content_with_line_numbers,
+      ask = true,
+      file_content = self.code.content,
+      code_lang = self.code.filetype,
       instructions = request,
       mode = "planning",
-      on_chunk = on_chunk,
-      on_complete = on_complete,
+      conversation = self.conversation,
+      on_chunk = function(chunk)
+        self:update_content(chunk, { append = true, scroll = true })
+      end,
+      on_complete = function(err)
+        if err then
+          Utils.error("Error occurred while processing the response: " .. vim.inspect(err), { once = true, title = "Avante" })
+          return
+        end
+        self:update_content("", { append = true, scroll = true })
+      end,
     })
-
-    if Config.behaviour.auto_apply_diff_after_generation then self:apply(false) end
   end
 
   local get_position = function()

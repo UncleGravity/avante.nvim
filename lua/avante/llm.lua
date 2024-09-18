@@ -29,6 +29,7 @@ local group = api.nvim_create_augroup("avante_llm", { clear = true })
 ---@field memory_context string | nil
 ---
 ---@class StreamOptions: TemplateOptions
+---@field conversation {role: string, content: string}[]
 ---@field ask boolean
 ---@field bufnr integer
 ---@field instructions string
@@ -88,6 +89,7 @@ M.stream = function(opts)
     system_prompt = Config.system_prompt,
     user_prompts = user_prompts,
     image_paths = image_paths,
+    conversation = opts.conversation or {},
   }
 
   ---@type string
